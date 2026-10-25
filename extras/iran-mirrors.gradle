@@ -1,0 +1,38 @@
+// android-create: Maven mirrors for restricted networks (e.g. Iran), added FIRST to every
+// Gradle build on this machine. Installed by `bash install.sh --iran`.
+// Remove this file to go back to the default repositories.
+// - New Android Studio projects (FAIL_ON_PROJECT_REPOS): mirrors added in settings.
+// - Flutter / older projects (repositories in build.gradle): mirrors also added per project.
+
+def pluginMirrors = [
+    'AliyunGradlePlugin': 'https://maven.aliyun.com/repository/gradle-plugin',
+    'AliyunGoogle'      : 'https://maven.aliyun.com/repository/google',
+    'AliyunPublic'      : 'https://maven.aliyun.com/repository/public',
+]
+def dependencyMirrors = [
+    'AliyunGoogle': 'https://maven.aliyun.com/repository/google',
+    'AliyunPublic': 'https://maven.aliyun.com/repository/public',
+]
+
+def addMirrors = { repos, mirrors ->
+    mirrors.each { repoName, repoUrl ->
+        if (repos.findByName(repoName) == null) {
+            repos.maven { name = repoName; url = new URI(repoUrl) }
+        }
+    }
+}
+
+beforeSettings { settings ->
+    settings.pluginManagement.repositories { repos -> addMirrors(repos, pluginMirrors) }
+    settings.dependencyResolutionManagement.repositories { repos -> addMirrors(repos, dependencyMirrors) }
+}
+
+settingsEvaluated { settings ->
+    def mode = settings.dependencyResolutionManagement.repositoriesMode.get().toString()
+    if (mode == 'PREFER_PROJECT') {
+        // Project-level repositories are allowed (e.g. Flutter): put mirrors first there too.
+        settings.gradle.allprojects { project ->
+            addMirrors(project.repositories, dependencyMirrors)
+        }
+    }
+}

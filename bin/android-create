@@ -1,0 +1,830 @@
+#!/usr/bin/env bash
+# android-create - create a new Android app (Kotlin + Jetpack Compose) from the terminal,
+# similar to `flutter create`, ready to run from VS Code with one click.
+#
+#   android-create <Name> <package> [--min-sdk N] [--no-open]
+#   android-create --vscode [DIR]      add one-click Run to an existing Android project
+#   android-create doctor              check your setup
+#
+# https://github.com/SajjadMohammadii/android-create   (MIT License)
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# --- Default versions (used only when no Android Studio project is found) ---
+GRADLE_VERSION="8.10.2"
+AGP_VERSION="8.7.2"
+KOTLIN_VERSION="2.0.21"
+COMPOSE_BOM="2024.10.01"
+CORE_KTX="1.13.1"
+ACTIVITY_COMPOSE="1.9.3"
+LIFECYCLE="2.8.7"
+COMPILE_SDK=35
+
+# --- Output helpers ---------------------------------------------------------
+if [[ -t 1 ]]; then
+    c_step=$'\e[36m'; c_ok=$'\e[32m'; c_warn=$'\e[33m'; c_err=$'\e[31m'; c_off=$'\e[0m'
+else
+    c_step=""; c_ok=""; c_warn=""; c_err=""; c_off=""
+fi
+step() { echo "${c_step}==> $*${c_off}"; }
+ok()   { echo "${c_ok}    $*${c_off}"; }
+warn() { echo "${c_warn}    $*${c_off}"; }
+bad()  { echo "${c_err}    $*${c_off}"; }
+die()  { echo "${c_err}Error: $*${c_off}" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+android-create $VERSION - create Android apps (Kotlin + Jetpack Compose) from the terminal
+
+Usage:
+  android-create <Name> <package> [--min-sdk N] [--no-open]
+  android-create --vscode [DIR]      Add one-click Run (F5) to an existing project (default: .)
+  android-create doctor              Check JDK, Android SDK, reference project and devices
+  android-create --version | --help
+
+Arguments:
+  Name        App/folder name, e.g. MyApp
+  package     Application id, e.g. ir.sajjad.myapp
+
+Options:
+  --min-sdk N   Minimum Android API level (21-36, default 24)
+  --no-open     Do not open the project in VS Code
+
+Environment:
+  ANDROID_CREATE_REF   Path of the Android Studio project to copy settings from
+                       (default: newest project in ~/AndroidStudioProjects)
+EOF
+}
+
+# ===========================================================================
+# Environment detection (shared by all commands)
+# ===========================================================================
+detect_java() {
+    if [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]]; then return 0; fi
+    local d
+    for d in \
+        /snap/android-studio/current/jbr \
+        /snap/android-studio/current/android-studio/jbr \
+        /opt/android-studio/jbr \
+        "$HOME/android-studio/jbr" \
+        "$HOME/.local/share/JetBrains/Toolbox/apps/android-studio/jbr" \
+        /usr/local/android-studio/jbr; do
+        if [[ -x "$d/bin/java" ]]; then export JAVA_HOME="$d"; return 0; fi
+    done
+    command -v java >/dev/null 2>&1
+}
+
+detect_sdk() {
+    SDK_DIR=""
+    local d
+    for d in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "$HOME/Android/Sdk" "$HOME/Android/sdk"; do
+        if [[ -n "$d" && -d "$d" ]]; then SDK_DIR="$d"; return 0; fi
+    done
+    return 1
+}
+
+find_ref_project() {
+    local r
+    for r in "$HOME/AndroidStudioProjects" "$HOME/StudioProjects"; do
+        [[ -d "$r" ]] || continue
+        find "$r" -mindepth 4 -maxdepth 4 -path '*/gradle/wrapper/gradle-wrapper.properties' \
+            -printf '%T@ %h\n' 2>/dev/null
+    done | sort -rn | while read -r _ wrapper_dir; do
+        local proj
+        proj="$(dirname "$(dirname "$wrapper_dir")")"
+        if [[ -f "$proj/gradlew" && -f "$wrapper_dir/gradle-wrapper.jar" ]]; then
+            echo "$proj"; break
+        fi
+    done
+}
+
+toml_get() {  # toml_get <file> <key>
+    sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n 1
+}
+ver_ge() {    # ver_ge A B  -> true if A >= B
+    [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" == "$2" ]]
+}
+
+# ===========================================================================
+# VS Code integration: one-click Run (F5), auto-refresh, tasks
+# ===========================================================================
+write_vscode_files() {  # write_vscode_files <project dir>
+    local dir="$1"
+    mkdir -p "$dir/.vscode"
+
+    cat > "$dir/run-android.sh" <<'RUNEOF'
+#!/usr/bin/env bash
+# Build, install and (re)start the app on the connected Android device.
+# Every run installs your latest changes and restarts the app.
+#
+#   ./run-android.sh              build + install + restart + show app logs
+#   ./run-android.sh --watch      rebuild + restart automatically on every save
+#   ./run-android.sh --no-logs    do not show logs after starting
+#   ./run-android.sh --release    use the release build type
+#
+# Created by android-create. Safe to edit.
+
+set -uo pipefail
+cd "$(dirname "$0")" || exit 1
+
+VARIANT="Debug"; WATCH=0; LOGS=1
+for arg in "$@"; do
+    case "$arg" in
+        --watch)   WATCH=1; LOGS=0 ;;
+        --no-logs) LOGS=0 ;;
+        --release) VARIANT="Release" ;;
+        -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+        *) echo "Unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
+
+if [[ -t 1 ]]; then B=$'\e[1;36m'; G=$'\e[1;32m'; R=$'\e[1;31m'; Y=$'\e[1;33m'; N=$'\e[0m'
+else B=""; G=""; R=""; Y=""; N=""; fi
+info() { echo "${B}▶ $*${N}"; }
+okay() { echo "${G}✔ $*${N}"; }
+fail() { echo "${R}✘ $*${N}" >&2; }
+
+# --- adb ---------------------------------------------------------------------
+ADB="$(command -v adb || true)"
+if [[ -z "$ADB" ]]; then
+    sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+    [[ -z "$sdk" && -f local.properties ]] && sdk="$(sed -n 's/^sdk\.dir=//p' local.properties | sed 's/\\:/:/g')"
+    [[ -z "$sdk" ]] && sdk="$HOME/Android/Sdk"
+    [[ -x "$sdk/platform-tools/adb" ]] && ADB="$sdk/platform-tools/adb"
+fi
+[[ -n "$ADB" ]] || { fail "adb not found. Install Android SDK platform-tools or add them to PATH."; exit 1; }
+
+# --- application id (read from the build file, so renaming keeps working) ---
+APP_ID="$(grep -oE 'applicationId[[:space:]]*=[[:space:]]*"[^"]+"' app/build.gradle.kts 2>/dev/null \
+          | head -n 1 | sed -E 's/.*"([^"]+)"/\1/')"
+[[ -n "$APP_ID" ]] || { fail "Could not read applicationId from app/build.gradle.kts"; exit 1; }
+
+# --- device ------------------------------------------------------------------
+pick_device() {
+    if [[ -n "${ANDROID_SERIAL:-}" ]]; then return 0; fi
+    local devices count
+    devices="$("$ADB" devices | awk 'NR>1 && $2=="device" {print $1}')"
+    count="$(printf '%s' "$devices" | grep -c . || true)"
+    if (( count == 0 )); then
+        fail "No device connected."
+        if "$ADB" devices | grep -q 'unauthorized'; then
+            echo "  Unlock your phone and tap 'Allow' on the USB debugging prompt."
+        elif "$ADB" devices | grep -q 'no permissions'; then
+            echo "  Fix permissions:  sudo apt install android-sdk-platform-tools-common"
+            echo "                    sudo usermod -aG plugdev \$USER   (then log out and in)"
+        else
+            echo "  Connect your phone with USB and enable Developer options > USB debugging."
+        fi
+        exit 1
+    fi
+    export ANDROID_SERIAL; ANDROID_SERIAL="$(printf '%s\n' "$devices" | head -n 1)"
+    if (( count > 1 )); then
+        echo "${Y}! $count devices connected; using $ANDROID_SERIAL (set ANDROID_SERIAL to choose).${N}"
+    fi
+}
+
+build_and_restart() {
+    local t0=$SECONDS
+    info "Building and installing $APP_ID on $ANDROID_SERIAL ..."
+    if ! ./gradlew "install$VARIANT" --console=plain -q; then
+        fail "Build failed (see errors above)."
+        return 1
+    fi
+    "$ADB" shell am force-stop "$APP_ID" >/dev/null 2>&1 || true
+    if ! "$ADB" shell monkey -p "$APP_ID" -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1; then
+        fail "Installed, but could not start the app (no launcher activity?)."
+        return 1
+    fi
+    okay "App restarted with your latest changes ($(( SECONDS - t0 ))s)"
+}
+
+show_logs() {
+    local pid=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pid="$("$ADB" shell pidof -s "$APP_ID" 2>/dev/null | tr -d '\r' || true)"
+        [[ -n "$pid" ]] && break
+        sleep 0.5
+    done
+    if [[ -z "$pid" ]]; then echo "${Y}! App is not running (it may have crashed).${N}"; "$ADB" logcat -d '*:E' | tail -n 40; return; fi
+    info "Logs of $APP_ID (pid $pid). Press Ctrl+C to stop watching logs."
+    "$ADB" logcat -v color --pid="$pid" 2>/dev/null || "$ADB" logcat --pid="$pid"
+}
+
+# Newest modification time among sources that affect the app
+sources_stamp() {
+    find app/src app/build.gradle.kts build.gradle.kts settings.gradle.kts gradle/libs.versions.toml \
+        -type f -newer "$1" -print -quit 2>/dev/null
+}
+
+pick_device
+
+if (( WATCH )); then
+    stamp="$(mktemp)"; trap 'rm -f "$stamp"' EXIT
+    build_and_restart || true
+    info "Watching for changes (save a file to reload). Press Ctrl+C to stop."
+    while true; do
+        sleep 1
+        if [[ -n "$(sources_stamp "$stamp")" ]]; then
+            touch "$stamp"
+            sleep 0.5   # let editors finish writing
+            echo
+            build_and_restart || true
+        fi
+    done
+else
+    build_and_restart || exit 1
+    if (( LOGS )); then show_logs; fi
+fi
+RUNEOF
+    chmod +x "$dir/run-android.sh"
+
+    cat > "$dir/.vscode/launch.json" <<'EOF'
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run on Android",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "./run-android.sh",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Run on Android (auto-reload on save)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "./run-android.sh --watch",
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
+EOF
+
+    cat > "$dir/.vscode/tasks.json" <<'EOF'
+{
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "Android: Run", "type": "shell", "command": "./run-android.sh",
+      "group": { "kind": "build", "isDefault": true }, "problemMatcher": [] },
+    { "label": "Android: Run (auto-reload on save)", "type": "shell",
+      "command": "./run-android.sh --watch", "isBackground": true, "problemMatcher": [] },
+    { "label": "Android: Build APK (debug)", "type": "shell",
+      "command": "./gradlew assembleDebug", "group": "build", "problemMatcher": [] },
+    { "label": "Android: Build APK (release)", "type": "shell",
+      "command": "./gradlew assembleRelease", "group": "build", "problemMatcher": [] },
+    { "label": "Android: Clean", "type": "shell", "command": "./gradlew clean", "problemMatcher": [] },
+    { "label": "Android: Devices", "type": "shell", "command": "adb devices -l", "problemMatcher": [] },
+    { "label": "Android: Logcat (errors)", "type": "shell", "command": "adb logcat '*:E'",
+      "isBackground": true, "problemMatcher": [] }
+  ]
+}
+EOF
+
+    cat > "$dir/.vscode/settings.json" <<'EOF'
+{
+  "files.exclude": {
+    "**/.gradle": true,
+    "**/build": true,
+    "**/.kotlin": true
+  },
+  "files.watcherExclude": {
+    "**/.gradle/**": true,
+    "**/build/**": true
+  }
+}
+EOF
+}
+
+cmd_vscode() {
+    local dir="${1:-.}"
+    dir="$(cd "$dir" 2>/dev/null && pwd)" || die "Folder not found: ${1:-.}"
+    [[ -f "$dir/gradlew" && -f "$dir/app/build.gradle.kts" ]] \
+        || die "$dir does not look like an Android project (needs gradlew and app/build.gradle.kts)."
+    step "Adding one-click Run to $dir"
+    for f in .vscode/launch.json .vscode/tasks.json .vscode/settings.json run-android.sh; do
+        if [[ -f "$dir/$f" ]]; then cp "$dir/$f" "$dir/$f.bak"; warn "Backed up existing $f to $f.bak"; fi
+    done
+    write_vscode_files "$dir"
+    ok "Added run-android.sh and .vscode/{launch,tasks,settings}.json"
+    echo
+    echo "In VS Code: press F5 (or the ▶ Run button) to install and start the app on your phone."
+}
+
+# ===========================================================================
+# doctor
+# ===========================================================================
+cmd_doctor() {
+    local problems=0
+    step "android-create $VERSION"
+
+    step "JDK"
+    if detect_java; then
+        local jv
+        jv="$("${JAVA_HOME:+$JAVA_HOME/bin/}java" -version 2>&1 | grep -m 1 -i 'version' || true)"
+        ok "${JAVA_HOME:-java on PATH}  ($jv)"
+    else
+        bad "No JDK found. Install Android Studio (it includes a JDK) or: sudo apt install openjdk-17-jdk"
+        problems=$((problems+1))
+    fi
+
+    step "Android SDK"
+    if detect_sdk; then
+        ok "$SDK_DIR"
+        local p bt
+        p="$(ls "$SDK_DIR/platforms" 2>/dev/null | tr '\n' ' ')"
+        bt="$(ls "$SDK_DIR/build-tools" 2>/dev/null | tr '\n' ' ')"
+        [[ -n "$p" ]]  && ok "Platforms:   $p"   || { bad "No SDK platforms installed"; problems=$((problems+1)); }
+        [[ -n "$bt" ]] && ok "Build tools: $bt"  || { bad "No build tools installed"; problems=$((problems+1)); }
+        [[ -x "$SDK_DIR/platform-tools/adb" ]] && ok "platform-tools (adb) installed" \
+            || { bad "platform-tools (adb) missing"; problems=$((problems+1)); }
+    else
+        bad "Not found. Open Android Studio once (it installs the SDK in ~/Android/Sdk) or set ANDROID_HOME."
+        problems=$((problems+1))
+    fi
+
+    step "Reference project (settings are copied from it)"
+    local ref="${ANDROID_CREATE_REF:-$(find_ref_project || true)}"
+    if [[ -n "$ref" ]]; then
+        ok "$ref"
+        local gv
+        gv="$(sed -n 's/.*gradle-\([0-9][0-9.]*[0-9]\)-\(bin\|all\)\.zip.*/\1/p' "$ref/gradle/wrapper/gradle-wrapper.properties" | head -n 1)"
+        ok "Gradle $gv"
+        [[ -f "$ref/gradle/libs.versions.toml" ]] && ok "AGP $(toml_get "$ref/gradle/libs.versions.toml" agp)"
+        if [[ ! -d "$ref/.gradle" && ! -d "$ref/app/build" ]]; then
+            warn "This project may never have been synced. Open it in Android Studio and let Gradle sync finish."
+        fi
+    else
+        bad "None. Create one project in Android Studio (Empty Activity) and let it sync successfully."
+        problems=$((problems+1))
+    fi
+
+    step "Gradle mirrors (optional, for restricted networks)"
+    if ls "$HOME/.gradle/init.d/"*.gradle* >/dev/null 2>&1; then
+        ok "Init scripts: $(ls "$HOME/.gradle/init.d/" | tr '\n' ' ')"
+    else
+        ok "None (not needed if Google/Maven Central are reachable)"
+    fi
+
+    step "Devices"
+    local adb_bin
+    adb_bin="$(command -v adb || true)"
+    if [[ -z "$adb_bin" && -x "${SDK_DIR:-$HOME/Android/Sdk}/platform-tools/adb" ]]; then
+        adb_bin="${SDK_DIR:-$HOME/Android/Sdk}/platform-tools/adb"
+    fi
+    if [[ -n "$adb_bin" ]]; then
+        local devs
+        devs="$("$adb_bin" devices 2>/dev/null | awk 'NR>1 && NF {print "    " $0}')"
+        if [[ -n "$devs" ]]; then echo "$devs"; else warn "No device connected (optional)."; fi
+    else
+        warn "adb not found"
+    fi
+
+    step "VS Code"
+    command -v code >/dev/null 2>&1 && ok "'code' command available" \
+        || warn "'code' command not found (sudo snap install code --classic)"
+
+    echo
+    if (( problems == 0 )); then echo "${c_ok}Everything looks good.${c_off}"; else echo "${c_err}$problems problem(s) found.${c_off}"; exit 1; fi
+}
+
+# ===========================================================================
+# Arguments
+# ===========================================================================
+NAME=""; PACKAGE=""; MIN_SDK=24; OPEN=1
+case "${1:-}" in
+    doctor)       cmd_doctor; exit 0 ;;
+    --vscode)     shift; cmd_vscode "${1:-.}"; exit 0 ;;
+    --version|-v) echo "android-create $VERSION"; exit 0 ;;
+esac
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --min-sdk) [[ $# -ge 2 ]] || die "--min-sdk needs a value"; MIN_SDK="$2"; shift 2 ;;
+        --no-open) OPEN=0; shift ;;
+        -*) die "Unknown option: $1 (see --help)" ;;
+        *)
+            if   [[ -z "$NAME" ]];    then NAME="$1"
+            elif [[ -z "$PACKAGE" ]]; then PACKAGE="$1"
+            else die "Too many arguments (see --help)"; fi
+            shift ;;
+    esac
+done
+[[ -n "$NAME" && -n "$PACKAGE" ]] || { usage; exit 1; }
+
+# --- Validation -------------------------------------------------------------
+[[ "$NAME" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]] \
+    || die "Invalid name '$NAME'. Use letters, digits and _ only, starting with a letter (e.g. MyApp)."
+[[ "$PACKAGE" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]] \
+    || die "Invalid package '$PACKAGE'. Use lowercase parts separated by dots (e.g. ir.sajjad.myapp)."
+[[ "$MIN_SDK" =~ ^[0-9]+$ ]] && (( MIN_SDK >= 21 && MIN_SDK <= 36 )) \
+    || die "--min-sdk must be a number between 21 and 36."
+
+KEYWORDS=" abstract as break class continue do else false for fun if in interface is null object package return super this throw true try typealias typeof val var when while "
+IFS='.' read -ra PARTS <<< "$PACKAGE"
+for part in "${PARTS[@]}"; do
+    [[ "$KEYWORDS" == *" $part "* ]] \
+        && die "Package part '$part' is a Kotlin keyword. Choose another name."
+done
+[[ "$PACKAGE" == com.example.* ]] \
+    && warn "Note: app stores (Google Play, Cafe Bazaar, ...) do not accept 'com.example' packages."
+
+PROJECT_DIR="$(pwd)/$NAME"
+[[ -e "$PROJECT_DIR" ]] && die "Folder already exists: $PROJECT_DIR"
+THEME="Theme.$NAME"
+
+# --- Find JDK and Android SDK -----------------------------------------------
+step "Checking JDK and Android SDK"
+if detect_java; then
+    ok "JAVA_HOME = ${JAVA_HOME:-(java on PATH)}"
+else
+    die "No JDK found. Install Android Studio (it includes a JDK) or: sudo apt install openjdk-17-jdk"
+fi
+if detect_sdk; then
+    ok "Android SDK = $SDK_DIR"
+else
+    warn "Android SDK not found. Set ANDROID_HOME, or edit local.properties after creation."
+fi
+
+# --- Templating -------------------------------------------------------------
+# write <path>  (content from stdin, placeholders replaced)
+write() {
+    local file="$PROJECT_DIR/$1"
+    mkdir -p "$(dirname "$file")"
+    sed -e "s|__NAME__|$NAME|g" \
+        -e "s|__PACKAGE__|$PACKAGE|g" \
+        -e "s|__MIN_SDK__|$MIN_SDK|g" \
+        -e "s|__COMPILE_SDK__|$COMPILE_SDK|g" \
+        -e "s|__AGP__|$AGP_VERSION|g" \
+        -e "s|__KOTLIN__|$KOTLIN_VERSION|g" \
+        -e "s|__COMPOSE_BOM__|$COMPOSE_BOM|g" \
+        -e "s|__CORE_KTX__|$CORE_KTX|g" \
+        -e "s|__ACTIVITY_COMPOSE__|$ACTIVITY_COMPOSE|g" \
+        -e "s|__LIFECYCLE__|$LIFECYCLE|g" \
+        -e "s|__THEME__|$THEME|g" > "$file"
+}
+
+# --- Reuse what already works in Android Studio ----------------------------
+# Copy the Gradle wrapper and library versions from your newest Android Studio
+# project. Those files are already downloaded/cached on this machine, so the new
+# project builds the same way, even when some download servers are unreachable.
+KOTLIN_MODE="plugin"   # "plugin" = kotlin-android plugin, "builtin" = AGP 9+ built-in Kotlin
+REF_PROJECT="${ANDROID_CREATE_REF:-$(find_ref_project || true)}"
+
+if [[ -n "$REF_PROJECT" ]]; then
+    step "Reusing setup from Android Studio project: $REF_PROJECT"
+    REF_GRADLE="$(sed -n 's/.*gradle-\([0-9][0-9.]*[0-9]\)-\(bin\|all\)\.zip.*/\1/p' \
+        "$REF_PROJECT/gradle/wrapper/gradle-wrapper.properties" | head -n 1)"
+    [[ -n "$REF_GRADLE" ]] && GRADLE_VERSION="$REF_GRADLE"
+
+    REF_TOML="$REF_PROJECT/gradle/libs.versions.toml"
+    if [[ -f "$REF_TOML" ]]; then
+        v="$(toml_get "$REF_TOML" agp)";                 [[ -n "$v" ]] && AGP_VERSION="$v"
+        v="$(toml_get "$REF_TOML" kotlin)"
+        if [[ -n "$v" ]]; then
+            if ver_ge "$v" "2.0.0"; then KOTLIN_VERSION="$v"
+            else warn "Kotlin $v in that project is older than 2.0; using $KOTLIN_VERSION."; fi
+        fi
+        v="$(toml_get "$REF_TOML" composeBom)";          [[ -n "$v" ]] && COMPOSE_BOM="$v"
+        v="$(toml_get "$REF_TOML" coreKtx)";             [[ -n "$v" ]] && CORE_KTX="$v"
+        v="$(toml_get "$REF_TOML" activityCompose)";     [[ -n "$v" ]] && ACTIVITY_COMPOSE="$v"
+        v="$(toml_get "$REF_TOML" lifecycleRuntimeKtx)"; [[ -n "$v" ]] && LIFECYCLE="$v"
+
+        if ver_ge "$AGP_VERSION" "9.0.0" && ! grep -q 'org.jetbrains.kotlin.android' "$REF_TOML"; then
+            KOTLIN_MODE="builtin"
+        fi
+    fi
+
+    REF_APP_GRADLE="$REF_PROJECT/app/build.gradle.kts"
+    if [[ -f "$REF_APP_GRADLE" ]]; then
+        v="$(grep -oE 'compileSdk[[:space:]]*=[[:space:]]*[0-9]+|release\([0-9]+\)' "$REF_APP_GRADLE" \
+             | grep -oE '[0-9]+' | head -n 1 || true)"
+        [[ -n "$v" ]] && COMPILE_SDK="$v"
+        REF_BUILD_TOOLS="$(sed -n 's/.*buildToolsVersion[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$REF_APP_GRADLE" | head -n 1)"
+    fi
+    ok "Gradle $GRADLE_VERSION, AGP $AGP_VERSION, Kotlin $KOTLIN_VERSION, compileSdk $COMPILE_SDK"
+else
+    warn "No Android Studio project found in ~/AndroidStudioProjects; using built-in versions."
+    warn "Tip: create and sync one project in Android Studio first (see README)."
+fi
+
+if [[ -n "${SDK_DIR:-}" && ! -d "$SDK_DIR/platforms/android-$COMPILE_SDK" ]]; then
+    warn "SDK platform android-$COMPILE_SDK is not installed; install it in Android Studio's SDK Manager."
+fi
+
+step "Creating project '$NAME' ($PACKAGE)"
+mkdir -p "$PROJECT_DIR"
+PKG_PATH="${PACKAGE//./\/}"
+
+write settings.gradle.kts <<'EOF'
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "__NAME__"
+include(":app")
+EOF
+
+write build.gradle.kts <<'EOF'
+plugins {
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.kotlin.android) apply false // @kotlin-plugin
+    alias(libs.plugins.kotlin.compose) apply false
+}
+EOF
+
+write gradle/libs.versions.toml <<'EOF'
+[versions]
+agp = "__AGP__"
+kotlin = "__KOTLIN__"
+composeBom = "__COMPOSE_BOM__"
+coreKtx = "__CORE_KTX__"
+activityCompose = "__ACTIVITY_COMPOSE__"
+lifecycle = "__LIFECYCLE__"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
+androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" } # @kotlin-plugin
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+EOF
+
+write gradle.properties <<'EOF'
+org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+android.useAndroidX=true
+kotlin.code.style=official
+android.nonTransitiveRClass=true
+EOF
+
+write app/build.gradle.kts <<'EOF'
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android) // @kotlin-plugin
+    alias(libs.plugins.kotlin.compose)
+}
+
+android {
+    namespace = "__PACKAGE__"
+    compileSdk = __COMPILE_SDK__
+    // @build-tools
+
+    defaultConfig {
+        applicationId = "__PACKAGE__"
+        minSdk = __MIN_SDK__
+        targetSdk = __COMPILE_SDK__
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { // @kotlin-plugin
+        jvmTarget = "17" // @kotlin-plugin
+    } // @kotlin-plugin
+    buildFeatures {
+        compose = true
+    }
+}
+
+dependencies {
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.material3)
+    debugImplementation(libs.androidx.compose.ui.tooling)
+}
+EOF
+
+write app/proguard-rules.pro <<'EOF'
+# Add project specific ProGuard rules here.
+EOF
+
+write app/src/main/AndroidManifest.xml <<'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/__THEME__">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
+EOF
+
+write app/src/main/res/values/strings.xml <<'EOF'
+<resources>
+    <string name="app_name">__NAME__</string>
+</resources>
+EOF
+
+write app/src/main/res/values/themes.xml <<'EOF'
+<resources>
+    <style name="__THEME__" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+    </style>
+</resources>
+EOF
+
+write "app/src/main/java/$PKG_PATH/MainActivity.kt" <<'EOF'
+package __PACKAGE__
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.tooling.preview.Preview
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            MaterialTheme {
+                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                    Greeting(
+                        name = "__NAME__",
+                        modifier = Modifier.padding(innerPadding),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun Greeting(name: String, modifier: Modifier = Modifier) {
+    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text(text = "Hello, $name!", style = MaterialTheme.typography.headlineMedium)
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+private fun GreetingPreview() {
+    MaterialTheme { Greeting(name = "__NAME__") }
+}
+EOF
+
+write .gitignore <<'EOF'
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+*.jks
+*.keystore
+key.properties
+*.bak
+EOF
+
+write_vscode_files "$PROJECT_DIR"
+
+if [[ -n "${SDK_DIR:-}" ]]; then
+    echo "sdk.dir=$SDK_DIR" > "$PROJECT_DIR/local.properties"
+fi
+
+# Kotlin mode: remove or unmark the kotlin-android plugin lines
+for f in build.gradle.kts app/build.gradle.kts gradle/libs.versions.toml; do
+    if [[ "$KOTLIN_MODE" == "builtin" ]]; then
+        sed -i '/@kotlin-plugin/d' "$PROJECT_DIR/$f"
+    else
+        sed -i -e 's| // @kotlin-plugin||' -e 's| # @kotlin-plugin||' "$PROJECT_DIR/$f"
+    fi
+done
+[[ "$KOTLIN_MODE" == "builtin" ]] && ok "Using AGP built-in Kotlin (no kotlin-android plugin)"
+
+# Build tools: keep the version your reference project pins, if any
+if [[ -n "${REF_BUILD_TOOLS:-}" ]]; then
+    sed -i "s|    // @build-tools|    buildToolsVersion = \"$REF_BUILD_TOOLS\"|" "$PROJECT_DIR/app/build.gradle.kts"
+    ok "Using build tools $REF_BUILD_TOOLS (same as reference project)"
+else
+    sed -i '/\/\/ @build-tools/d' "$PROJECT_DIR/app/build.gradle.kts"
+fi
+
+# Keep Android Gradle flags that your Android Studio project relies on
+if [[ -n "$REF_PROJECT" && -f "$REF_PROJECT/gradle.properties" ]]; then
+    grep -E '^[[:space:]]*android\.(builtInKotlin|newDsl)[[:space:]]*=' "$REF_PROJECT/gradle.properties" \
+        >> "$PROJECT_DIR/gradle.properties" || true
+fi
+
+ok "Project files written"
+
+# --- Gradle wrapper ---------------------------------------------------------
+step "Setting up Gradle wrapper ($GRADLE_VERSION)"
+
+copy_wrapper_from() {  # copy_wrapper_from <dir containing gradlew + gradle/wrapper>
+    cp "$1/gradlew" "$PROJECT_DIR/"
+    [[ -f "$1/gradlew.bat" ]] && cp "$1/gradlew.bat" "$PROJECT_DIR/"
+    mkdir -p "$PROJECT_DIR/gradle/wrapper"
+    cp "$1/gradle/wrapper/gradle-wrapper.jar" "$1/gradle/wrapper/gradle-wrapper.properties" \
+        "$PROJECT_DIR/gradle/wrapper/"
+    chmod +x "$PROJECT_DIR/gradlew"
+}
+
+if [[ -n "$REF_PROJECT" ]]; then
+    # Same wrapper + same distribution URL as Android Studio -> uses the already cached Gradle
+    copy_wrapper_from "$REF_PROJECT"
+    ok "gradlew copied from $REF_PROJECT"
+else
+    find_gradle() {
+        local dists="${GRADLE_USER_HOME:-$HOME/.gradle}/wrapper/dists"
+        if [[ -d "$dists" ]]; then
+            find "$dists" -path '*/bin/gradle' -type f 2>/dev/null | sort -rV | head -n 1
+        fi
+        command -v gradle 2>/dev/null || true
+    }
+    GRADLE_BIN="$(find_gradle | head -n 1)"
+    [[ -n "$GRADLE_BIN" ]] || die "No Gradle found. Create and sync one project in Android Studio first, then run android-create again."
+    chmod +x "$GRADLE_BIN" 2>/dev/null || true
+    ok "Using Gradle: $GRADLE_BIN"
+
+    TMP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$TMP_DIR"' EXIT
+    mkdir -p "$TMP_DIR/w"
+    echo 'rootProject.name = "wrapper"' > "$TMP_DIR/w/settings.gradle.kts"
+    # --no-validate-url: do not contact services.gradle.org while generating the wrapper
+    if ! ( cd "$TMP_DIR/w" && "$GRADLE_BIN" wrapper --gradle-version "$GRADLE_VERSION" \
+              --distribution-type bin --no-validate-url --quiet --offline ) 2>/dev/null; then
+        ( cd "$TMP_DIR/w" && "$GRADLE_BIN" wrapper --gradle-version "$GRADLE_VERSION" \
+              --distribution-type bin --quiet --offline ) || die "gradle wrapper failed"
+    fi
+    copy_wrapper_from "$TMP_DIR/w"
+    ok "gradlew ready"
+    warn "The first ./gradlew run downloads Gradle $GRADLE_VERSION from services.gradle.org."
+fi
+
+# --- Done -------------------------------------------------------------------
+echo
+echo "${c_ok}Project created: $PROJECT_DIR${c_off}"
+echo
+echo "Run it on your phone:"
+echo "  VS Code:   press F5 (Run on Android)"
+echo "  Terminal:  cd $NAME && ./run-android.sh          (add --watch to reload on every save)"
+echo
+
+if (( OPEN )); then
+    if command -v code >/dev/null 2>&1; then
+        code "$PROJECT_DIR"
+    else
+        warn "'code' command not found. Install VS Code (e.g. sudo snap install code --classic)."
+    fi
+fi
