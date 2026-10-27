@@ -5,12 +5,14 @@
 #   android-create <Name> <package> [--min-sdk N] [--no-open]
 #   android-create --vscode [DIR]      add one-click Run to an existing Android project
 #   android-create doctor              check your setup
+#   android-create gradle <tasks>      ./gradlew that retries network failures and fetches cut-off files
+#   android-create fetch g:a:v         download one big library in resumable, verified pieces
 #
 # https://github.com/SajjadMohammadii/android-create   (MIT License)
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # --- Default versions (used only when no Android Studio project is found) ---
 GRADLE_VERSION="8.10.2"
@@ -42,6 +44,10 @@ Usage:
   android-create <Name> <package> [--min-sdk N] [--no-open]
   android-create --vscode [DIR]      Add one-click Run (F5) to an existing project (default: .)
   android-create doctor              Check JDK, Android SDK, reference project and devices
+  android-create gradle <tasks...>   Run ./gradlew; on a network failure fetch the cut-off files and retry
+  android-create fetch group:artifact:version[@jar|@aar]
+                                     Download one library in resumable pieces, verify its SHA-1
+                                     and install it in ~/.m2 (used first by every build)
   android-create --version | --help
 
 Arguments:
@@ -53,8 +59,9 @@ Options:
   --no-open     Do not open the project in VS Code
 
 Environment:
-  ANDROID_CREATE_REF   Path of the Android Studio project to copy settings from
-                       (default: newest project in ~/AndroidStudioProjects)
+  ANDROID_CREATE_REF       Path of the Android Studio project to copy settings from
+                           (default: newest project in ~/AndroidStudioProjects)
+  ANDROID_CREATE_ATTEMPTS  How many times 'gradle' tries a build that fails on the network (default 8)
 EOF
 }
 
@@ -188,7 +195,10 @@ pick_device() {
 build_and_restart() {
     local t0=$SECONDS
     info "Building and installing $APP_ID on $ANDROID_SERIAL ..."
-    if ! ./gradlew "install$VARIANT" --console=plain -q; then
+    # android-create retries network failures and fetches files the connection keeps cutting off.
+    local gradle=(./gradlew)
+    command -v android-create >/dev/null 2>&1 && gradle=(android-create gradle)
+    if ! "${gradle[@]}" "install$VARIANT" --console=plain -q; then
         fail "Build failed (see errors above)."
         return 1
     fi
@@ -363,6 +373,11 @@ cmd_doctor() {
     step "Gradle mirrors (optional, for restricted networks)"
     if ls "$HOME/.gradle/init.d/"*.gradle* >/dev/null 2>&1; then
         ok "Init scripts: $(ls "$HOME/.gradle/init.d/" | tr '\n' ' ')"
+        if grep -q AndroidCreateFetched "$HOME/.gradle/init.d/"*.gradle* 2>/dev/null; then
+            ok "Fetched libraries read from ~/.m2: $(wc -l < "$FETCHED_LIST" 2>/dev/null || echo 0)"
+        else
+            warn "Mirrors script is from an older version: run 'bash install.sh --iran' again to use 'android-create fetch'."
+        fi
     else
         ok "None (not needed if Google/Maven Central are reachable)"
     fi
@@ -390,11 +405,174 @@ cmd_doctor() {
 }
 
 # ===========================================================================
+# fetch / gradle: builds that survive unstable networks
+# ===========================================================================
+# Mirrors on restricted networks often cut big files (the Kotlin compiler, KSP, Robolectric) off half way,
+# and Gradle then starts them over from zero, forever. `fetch` downloads such a file in resumable pieces,
+# checks it against the repository's SHA-1 and installs it in ~/.m2; the init script installed by
+# `install.sh --iran` lets every build read the fetched modules from there first.
+
+M2_DIR="$HOME/.m2/repository"
+FETCHED_LIST="$HOME/.m2/android-create-fetched.txt"
+FETCH_REPOS=(
+    https://repo1.maven.org/maven2
+    https://maven.aliyun.com/repository/public
+    https://maven.aliyun.com/repository/google
+    https://dl.google.com/dl/android/maven2
+    https://maven.aliyun.com/repository/gradle-plugin
+    https://plugins.gradle.org/m2
+)
+# Output of a failed build that means "the network failed", not "the code is wrong".
+NETWORK_ERRORS='Could not download|Could not GET|Could not HEAD|Premature end of Content-Length|Read timed out|Connect timed out|connect timed out|Connection reset|Connection refused|Remote host terminated the handshake|SSLHandshakeException|SSLException|Unable to tunnel|Got socket exception|No route to host|UnknownHostException|SocketException|SocketTimeoutException|zip END header not found|error in opening zip file'
+
+http_small() {  # http_small <url> <out file>: 0 = downloaded, 1 = not there (404), 2 = network kept failing
+    local code _
+    for _ in 1 2 3 4 5; do
+        code="$(curl -sL --connect-timeout 20 -m 90 -o "$2" -w '%{http_code}' "$1" 2>/dev/null || true)"
+        case "$code" in
+            200) [[ -s "$2" ]] && return 0 ;;
+            404|403|410) return 1 ;;
+        esac
+        sleep 2
+    done
+    return 2
+}
+
+pom_value() {  # pom_value <pom> <tag> [parent]: first <tag> at top level (or inside <parent>)
+    python3 -I - "$1" "$2" "${3:-}" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+scope = re.search(r"<parent>(.*?)</parent>", text, re.S)
+if sys.argv[3]:
+    text = scope.group(1) if scope else ""
+else:
+    text = re.sub(r"<parent>.*?</parent>", "", text, flags=re.S)
+    text = re.sub(r"<(dependencies|dependencyManagement|build|profiles|plugins)>.*?</\1>", "", text, flags=re.S)
+m = re.search(r"<%s>\s*([^<\s]+)\s*</%s>" % (sys.argv[2], sys.argv[2]), text)
+print(m.group(1) if m else "")
+PY
+}
+
+record_fetched() {  # record_fetched group:artifact
+    mkdir -p "$(dirname "$FETCHED_LIST")"
+    touch "$FETCHED_LIST"
+    grep -qxF "$1" "$FETCHED_LIST" || echo "$1" >> "$FETCHED_LIST"
+}
+
+download_verified() {  # download_verified <path in repo> <dest file> <sha1> <repo>...: resumable, verified
+    local rel="$1" dest="$2" sha1="$3"; shift 3
+    local repos=("$@") part="$dest.part" attempt repo size total
+    for attempt in $(seq 1 80); do
+        repo="${repos[$(( (attempt - 1) % ${#repos[@]} ))]}"
+        curl -sL --connect-timeout 20 -m 600 -C - -o "$part" "$repo/$rel" 2>/dev/null || true
+        if [[ -f "$part" && "$(sha1sum "$part" | cut -d' ' -f1)" == "$sha1" ]]; then
+            mv "$part" "$dest"
+            return 0
+        fi
+        size="$(stat -c%s "$part" 2>/dev/null || echo 0)"
+        total="$(curl -sIL --connect-timeout 20 -m 30 "$repo/$rel" 2>/dev/null \
+            | awk 'tolower($1)=="content-length:"{n=$2+0} END{print n+0}')"
+        # A complete file with the wrong checksum cannot be resumed: start it over.
+        if (( total > 0 && size >= total )); then rm -f "$part"; size=0; fi
+        printf '    attempt %d: %s / %s MB\n' "$attempt" "$(( size / 1048576 ))" "$(( total / 1048576 ))"
+        sleep 2
+    done
+    return 1
+}
+
+cmd_fetch() {  # cmd_fetch group:artifact:version[@ext] [pom-only]
+    local coord="${1:-}" pom_only="${2:-}"
+    [[ "$coord" =~ ^[^:@]+:[^:@]+:[^:@]+(@[a-z]+)?$ ]] || die "usage: android-create fetch group:artifact:version[@jar|@aar]"
+    command -v curl >/dev/null || die "curl is not installed (sudo apt install curl)"
+    local ext="" group artifact version
+    [[ "$coord" == *@* ]] && { ext="${coord##*@}"; coord="${coord%@*}"; }
+    IFS=: read -r group artifact version <<< "$coord"
+    local base="${group//.//}/$artifact/$version/$artifact-$version"
+    local dir="$M2_DIR/${group//.//}/$artifact/$version"
+    local tmp repo found=() status
+    mkdir -p "$dir"
+    tmp="$(mktemp)"
+
+    # 1. The POM: it says what the artifact is packaged as, and which repositories have it.
+    for repo in "${FETCH_REPOS[@]}"; do
+        status=0; http_small "$repo/$base.pom" "$tmp" || status=$?
+        (( status == 0 )) && { cat "$tmp" > "$dir/$artifact-$version.pom"; found+=("$repo"); }
+    done
+    if (( ${#found[@]} == 0 )); then rm -f "$tmp"; bad "$coord: not found in any repository"; return 1; fi
+
+    # A parent POM is read from the same repository, so it comes along (POM only).
+    local pg pa pv
+    pg="$(pom_value "$dir/$artifact-$version.pom" groupId parent)"
+    pa="$(pom_value "$dir/$artifact-$version.pom" artifactId parent)"
+    pv="$(pom_value "$dir/$artifact-$version.pom" version parent)"
+    [[ -n "$pg" && -n "$pa" && -n "$pv" ]] && { cmd_fetch "$pg:$pa:$pv" pom-only >/dev/null || true; }
+    record_fetched "$group:$artifact"
+    if [[ -n "$pom_only" ]]; then rm -f "$tmp"; return 0; fi
+
+    # Gradle module metadata, when published, describes the same files; keep resolution as it is remotely.
+    for repo in "${found[@]}"; do
+        http_small "$repo/$base.module" "$tmp" && { cat "$tmp" > "$dir/$artifact-$version.module"; break; }
+    done
+
+    if [[ -z "$ext" ]]; then
+        ext="$(pom_value "$dir/$artifact-$version.pom" packaging)"
+        case "$ext" in ""|bundle|jar|maven-plugin|eclipse-plugin) ext=jar ;; aar) ;; pom) ok "$coord (POM only)"; rm -f "$tmp"; return 0 ;; *) ext=jar ;; esac
+    fi
+
+    # 2. The checksum, then the file itself, in resumable pieces from every repository that has it.
+    local sha1="" dest="$dir/$artifact-$version.$ext"
+    for repo in "${found[@]}"; do
+        http_small "$repo/$base.$ext.sha1" "$tmp" && { sha1="$(head -c 40 "$tmp")"; break; }
+    done
+    rm -f "$tmp"
+    [[ "$sha1" =~ ^[0-9a-f]{40}$ ]] || { bad "$coord: no SHA-1 published; cannot verify it"; return 1; }
+    if [[ -f "$dest" && "$(sha1sum "$dest" | cut -d' ' -f1)" == "$sha1" ]]; then
+        ok "$coord already fetched"
+        return 0
+    fi
+    step "Fetching $coord ($ext)"
+    if download_verified "$base.$ext" "$dest" "$sha1" "${found[@]}"; then
+        ok "$dest (SHA-1 verified)"
+    else
+        bad "Gave up on $coord; run the same command again to continue where it stopped."
+        return 1
+    fi
+}
+
+failed_artifacts() {  # failed_artifacts <build log>: group:artifact:version@ext of files Gradle could not download
+    grep -oE 'Could not download [^ ]+\.(jar|aar) \([^)]+\)' "$1" 2>/dev/null \
+        | sed -E 's/^Could not download [^ ]+\.(jar|aar) \(([^)]+)\)$/\2@\1/' | sort -u
+}
+
+cmd_gradle() {  # cmd_gradle <gradle args...>: ./gradlew, retried while the failure is a network one
+    [[ -x ./gradlew ]] || die "No ./gradlew here; run this in an Android project."
+    local attempts="${ANDROID_CREATE_ATTEMPTS:-8}" log i coord args=("$@")
+    log="$(mktemp)"
+    for (( i = 1; i <= attempts; i++ )); do
+        if ./gradlew "${args[@]}" 2>&1 | tee "$log"; then rm -f "$log"; return 0; fi
+        if ! grep -qE "$NETWORK_ERRORS" "$log"; then rm -f "$log"; return 1; fi
+        # Big files that keep being cut off: fetch them in resumable pieces instead. The repositories
+        # change with them, so the next attempt must not reuse a cached configuration.
+        for coord in $(failed_artifacts "$log"); do
+            cmd_fetch "$coord" && args=("$@" --no-configuration-cache) || true
+        done
+        (( i < attempts )) && warn "Network error; trying again ($i/$attempts) ..."
+        sleep 3
+    done
+    rm -f "$log"
+    bad "Still failing after $attempts attempts."
+    return 1
+}
+
+# ===========================================================================
 # Arguments
 # ===========================================================================
 NAME=""; PACKAGE=""; MIN_SDK=24; OPEN=1
 case "${1:-}" in
     doctor)       cmd_doctor; exit 0 ;;
+    fetch)        shift; cmd_fetch "$@"; exit $? ;;
+    gradle)       shift; cmd_gradle "$@"; exit $? ;;
     --vscode)     shift; cmd_vscode "${1:-.}"; exit 0 ;;
     --version|-v) echo "android-create $VERSION"; exit 0 ;;
 esac

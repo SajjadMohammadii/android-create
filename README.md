@@ -132,6 +132,8 @@ android-create <Name> <package> [options]
 | `android-create <Name> <package>`           | Create a new project                                 |
 | `android-create --vscode [DIR]`             | Add one-key Run to an existing project               |
 | `android-create doctor`                     | Check the development environment                    |
+| `android-create gradle <tasks...>`          | Run `./gradlew`, retrying network failures and fetching files the connection keeps cutting off |
+| `android-create fetch group:artifact:version` | Download one library in resumable, SHA-1 verified pieces into `~/.m2` |
 | `android-create --version`                  | Show the version                                     |
 | `android-create --help`                     | Show help                                            |
 
@@ -141,6 +143,7 @@ android-create <Name> <package> [options]
 | -------------------- | -------------------------------------------------------------------------- |
 | `ANDROID_CREATE_REF` | Path of the Android Studio project to copy configuration from.             |
 | `ANDROID_SERIAL`     | Device to run on when several are connected (used by `run-android.sh`).    |
+| `ANDROID_CREATE_ATTEMPTS` | How many times `android-create gradle` tries a build that fails on the network (default 8). |
 
 ### Generated project
 
@@ -203,6 +206,8 @@ MyApp/
 ```
 
 Every run stops the running app and starts the newly installed build, so you always see your latest changes.
+
+When `android-create` is installed, `run-android.sh` builds through `android-create gradle`, so a dropped connection is retried instead of failing the run.
 
 ### Add one-key Run to an existing project
 
@@ -324,6 +329,18 @@ bash install.sh --iran
 | `~/.gradle/init.d/android-create-mirrors.gradle`      | Adds [Aliyun](https://developer.aliyun.com/mvn/guide) Maven mirrors first for every Gradle build: Android Studio, android-create and Flutter projects. No per-project changes needed. |
 | `~/.gradle/gradle.properties`                         | Increases download retries and timeouts so short connection drops do not fail the build.  |
 
+### Big files that never finish downloading
+
+On unstable connections the mirrors often cut large libraries off half way (the Kotlin compiler, KSP, Robolectric's Android runtime: 40 to 200 MB). Gradle then starts the file over from zero on every retry and never finishes it.
+
+`android-create gradle` handles this for you: when a build fails with `Could not download <file> (<group:artifact:version>)`, it fetches that file itself and runs the build again. You can also fetch a library by hand:
+
+```bash
+android-create fetch org.jetbrains.kotlin:kotlin-compiler-embeddable:2.2.0
+```
+
+`fetch` downloads in resumable pieces (each drop continues where it stopped, alternating Maven Central, Aliyun and Google), checks the repository's SHA-1, and installs the library, its POM and any parent POM in `~/.m2/repository`. Fetched modules are listed in `~/.m2/android-create-fetched.txt`; the mirrors script installed by `bash install.sh --iran` reads exactly those modules from `~/.m2` first, in every project, with no change to the project itself.
+
 ### Installing SDK packages through a mirror
 
 The SDK Manager downloads from `dl.google.com`. If it is unreachable, use the Tencent Cloud mirror:
@@ -394,13 +411,13 @@ Also make sure **Offline Mode** is turned off in Android Studio's Gradle panel.
 
 <br>
 
-The connection dropped during a download. Run the build again; files that were already downloaded are reused:
+The connection dropped during a download. Build through `android-create gradle`, which retries and fetches files that keep getting cut off:
 
 ```bash
-for i in 1 2 3 4 5; do ./gradlew help && break; sleep 5; done
+android-create gradle assembleDebug
 ```
 
-`bash install.sh --iran` raises the number of automatic retries.
+`bash install.sh --iran` raises the number of automatic retries. See [Big files that never finish downloading](#big-files-that-never-finish-downloading).
 
 </details>
 

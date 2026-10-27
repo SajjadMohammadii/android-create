@@ -1,6 +1,8 @@
 // android-create: Maven mirrors for restricted networks (e.g. Iran), added FIRST to every
 // Gradle build on this machine. Installed by `bash install.sh --iran`.
 // Remove this file to go back to the default repositories.
+// - Libraries fetched with `android-create fetch` (big files the mirrors keep cutting off) are read
+//   from ~/.m2 first; only the modules listed in ~/.m2/android-create-fetched.txt, nothing else.
 // - New Android Studio projects (FAIL_ON_PROJECT_REPOS): mirrors added in settings.
 // - Flutter / older projects (repositories in build.gradle): mirrors also added per project.
 
@@ -14,6 +16,20 @@ def dependencyMirrors = [
     'AliyunPublic': 'https://maven.aliyun.com/repository/public',
 ]
 
+def fetchedList = new File(System.getProperty('user.home'), '.m2/android-create-fetched.txt')
+def fetchedModules = fetchedList.exists()
+    ? fetchedList.readLines()*.trim().findAll { it && !it.startsWith('#') && it.count(':') == 1 }
+    : []
+
+def addFetched = { repos ->
+    if (fetchedModules.isEmpty() || repos.findByName('AndroidCreateFetched') != null) return
+    repos.mavenLocal {
+        name = 'AndroidCreateFetched'
+        // Only these modules; a version that is not in ~/.m2 is looked up in the next repository.
+        content { fetchedModules.each { module -> def (g, a) = module.split(':'); includeModule(g, a) } }
+    }
+}
+
 def addMirrors = { repos, mirrors ->
     mirrors.each { repoName, repoUrl ->
         if (repos.findByName(repoName) == null) {
@@ -23,8 +39,8 @@ def addMirrors = { repos, mirrors ->
 }
 
 beforeSettings { settings ->
-    settings.pluginManagement.repositories { repos -> addMirrors(repos, pluginMirrors) }
-    settings.dependencyResolutionManagement.repositories { repos -> addMirrors(repos, dependencyMirrors) }
+    settings.pluginManagement.repositories { repos -> addFetched(repos); addMirrors(repos, pluginMirrors) }
+    settings.dependencyResolutionManagement.repositories { repos -> addFetched(repos); addMirrors(repos, dependencyMirrors) }
 }
 
 settingsEvaluated { settings ->
@@ -32,6 +48,7 @@ settingsEvaluated { settings ->
     if (mode == 'PREFER_PROJECT') {
         // Project-level repositories are allowed (e.g. Flutter): put mirrors first there too.
         settings.gradle.allprojects { project ->
+            addFetched(project.repositories)
             addMirrors(project.repositories, dependencyMirrors)
         }
     }
